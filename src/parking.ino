@@ -12,10 +12,14 @@ const int PIN_MOTOR_R = 4;
 // ベース速度（90が停止。左は大きく、右は小さくすると前進する）
 int baseSpeedL = 150; 
 int baseSpeedR = 30;  
+// アライメント（その場旋回）専用のPゲイン
+// 前進時のKpとは最適な値が異なるため、独立させます
+// float Kp_align = 0.08;
 
 // PI制御のゲイン（最初はKpだけ調整し、Kiは0にしておくのが定石です）
 float Kp = 0.05; //比例ゲイン(P制御)：今のズレを直すパラメータ
 float Ki = 0.00; //積分ゲイン(I制御)：過去のズレの蓄積を直すパラメータ
+// int CROSS_THRESHOLD = 3000; // 6個のセンサ値の合計がこれを超えたら交差点と判定
 
 // --- グローバル変数 ---
 int v[6] = {0, 0, 0, 0, 0, 0}; // 6連センサの値
@@ -73,6 +77,9 @@ int calculateError() {
 
 // PI制御によるライントレース実行関数
 void traceLinePI() {
+  // ※ここでreadLineSensors()を呼ぶと、後でisCrossroad()を呼ぶときに
+  // センサを2回読んでしまうので、読み取り処理はloop()側に移動させるのがベストです。
+  // (今回は現状のままにしておきます)
   readLineSensors();
   
   int error = calculateError();
@@ -92,10 +99,102 @@ void traceLinePI() {
   setMotors(outL, outR);
 }
 
+/*
+// 【追加・解除箇所D】アライメント（姿勢補正）関数
+// (ステップ4でコメントアウトを解除します)
+void alignToLine() {
+  Serial.println("Start Alignment...");
+  
+  while (true) {
+    readLineSensors();
+    int error = calculateError();
+    
+    // 誤差が「許容範囲（例: -10 〜 10）」に収まったら補正完了とみなしてループを抜ける
+    if (abs(error) < 10) {
+      setMotors(90, 90); // 停止
+      Serial.println("Alignment Complete!");
+      break; 
+    }
+    
+    // アライメント用のP制御（その場旋回）
+    int turnSpeed = error * Kp_align;
+    
+    // リミッタ（旋回スピードが速すぎると線を通り過ぎてしまうため）
+    if (turnSpeed > 40) turnSpeed = 40;
+    if (turnSpeed < -40) turnSpeed = -40;
+    
+    // BEATLEの仕様：左右同値（150, 150等）で右回転、（30, 30等）で左回転
+    setMotors(90 + turnSpeed, 90 + turnSpeed);
+    
+    delay(10);
+  }
+}
+*/
+
+/*
+// 【追加・解除箇所E】テスト用の旋回関数
+// (ステップ4でコメントアウトを解除します)
+void turn90Right() {
+  // 150, 150 は右回転 [cite: 3]
+  setMotors(150, 150); 
+  delay(500); // 90度くらい回る適当な時間（後で実機で調整）
+  setMotors(90, 90);
+}
+*/
+
+// ==========================================
+// レイヤ3: 意思決定レイヤ (Decision Making)
+// ==========================================
+
+/* // 【追加・解除箇所B】交差点判定関数
+// (ステップ3でコメントアウトを解除します)
+bool isCrossroad() {
+  int sum = 0;
+  // 6つのセンサ値の合計を計算
+  for (int i = 0; i < 6; i++) {
+    sum += v[i];
+  }
+  
+  // デバッグ用：シリアルモニタで合計値を確認
+  // Serial.print("Sensor Sum: ");
+  // Serial.println(sum);
+
+  // 合計値が閾値を超えていたら「交差点」と判定(trueを返す)
+  if (sum > CROSS_THRESHOLD) {
+    return true;
+  } else {
+    return false;
+  }
+}
+*/
+
 // ==========================================
 // レイヤ4: メインループ
 // ==========================================
 void loop() {
+  /*
+  // 【追加・解除箇所C】交差点で停止するメインループ処理
+  // (ステップ3でこのブロックのコメントアウトを解除し、元のtraceLinePI()を消します)
+  
+  readLineSensors(); // 毎ループ最初に1回だけセンサを読む
+
+  if (isCrossroad() == true) {
+    // 交差点を検知したらモータを停止(90)して、無限ループで待機
+    setMotors(90, 90);
+    Serial.println("Crossroad Detected! STOP.");
+    while(1) {
+      delay(100); // 完全に停止したまま動かない
+    }
+  } else {
+    // 交差点でなければライントレースを続ける
+    traceLinePI();
+  }
+  */
+
+  // --- ステップ1（現在）の処理 ---
+  // 上記のコメントを外した時は、以下の1行は削除（またはコメントアウト）してください
+
+  
   // ひたすらライントレースを続ける
   traceLinePI();
   
