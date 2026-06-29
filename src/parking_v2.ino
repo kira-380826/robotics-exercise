@@ -10,11 +10,11 @@ const int PIN_MOTOR_R = 4;
 
 // --- 調整用パラメータ（実機で後から変更する部分） ---
 // ベース速度（90が停止。左は大きく、右は小さくすると前進する）
-int baseSpeedL = 150; 
-int baseSpeedR = 30;  
+int baseSpeedL = 143; 
+int baseSpeedR = 34;  
 // アライメント（その場旋回）専用のPゲイン
 // 前進時のKpとは最適な値が異なるため、独立させます
-float Kp_align = 0.08;
+float Kp_align = 0.10;
 
 // PI制御のゲイン（最初はKpだけ調整し、Kiは0にしておくのが定石です）
 float Kp = 0.04; //比例ゲイン(P制御)：今のズレを直すパラメータ
@@ -116,7 +116,7 @@ void alignToLine() {
     int error = calculateError();
     
     // 誤差が「許容範囲（例: -10 〜 10）」に収まったら補正完了とみなしてループを抜ける
-    if (abs(error) < 10) {
+    if (abs(error) < 5) {
       setMotors(93, 91); // 停止
       Serial.println("Alignment Complete!");
       break; 
@@ -126,13 +126,13 @@ void alignToLine() {
     int turnSpeed = error * Kp_align;
     
     // リミッタ（旋回スピードが速すぎると線を通り過ぎてしまうため）
-    if (turnSpeed > 40) turnSpeed = 40;
-    if (turnSpeed < -40) turnSpeed = -40;
+    if (turnSpeed > 30) turnSpeed = 30;
+    if (turnSpeed < -30) turnSpeed = -30;
     
     // BEATLEの仕様：左右同値（150, 150等）で右回転、（30, 30等）で左回転
     setMotors(93 + turnSpeed, 91 + turnSpeed);
     
-    delay(10);
+    delay(75);
   }
 }
 
@@ -143,8 +143,11 @@ void alignToLine() {
 void turn90Right() {
   // 150, 150 は右回転 [cite: 3]
   setMotors(150, 150); 
-  delay(600); // 90度くらい回る適当な時間（後で実機で調整）
+  delay(530); // 90度くらい回る適当な時間（後で実機で調整）
   setMotors(93, 91);
+  delay(100);
+  setMotors(98,88);
+  delay(500);
 }
 
 
@@ -188,12 +191,12 @@ void loop() {
     // 交差点を検知したらモータを停止(90)して、無限ループで待機
     setMotors(93, 91);
     delay(200);
-    setMotors(100,86);
+    setMotors(98,88);
     delay(100);
     Serial.println("Crossroad Detected! STOP.");
     delay(1000);
     turn90Right();
-    //alignToLine();
+    alignToLine();
     
     while(1) {
       delay(100); // 完全に停止したまま動かない
