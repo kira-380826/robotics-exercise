@@ -1,0 +1,234 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>BEATLE 駐車プログラム アップデートガイド</title>
+  <script src="https://cdn.jsdelivr.net/npm/mermaid/dist/mermaid.min.js"></script>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600&family=Noto+Sans+JP:wght@400;700&display=swap" rel="stylesheet">
+  <style>
+    :root {
+      --primary: #2563eb;
+      --secondary: #3b82f6;
+      --bg: #f8fafc;
+      --card-bg: #ffffff;
+      --text: #1e293b;
+      --text-light: #64748b;
+      --danger: #ef4444;
+      --warning: #f59e0b;
+    }
+    body {
+      font-family: 'Inter', 'Noto Sans JP', sans-serif;
+      background-color: var(--bg);
+      color: var(--text);
+      line-height: 1.6;
+      margin: 0;
+      padding: 0;
+    }
+    header {
+      background: linear-gradient(135deg, var(--primary), var(--secondary));
+      color: white;
+      padding: 3rem 2rem;
+      text-align: center;
+      box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1);
+    }
+    header h1 {
+      margin: 0;
+      font-size: 2.5rem;
+      letter-spacing: -0.025em;
+    }
+    header p {
+      margin-top: 1rem;
+      font-size: 1.1rem;
+      opacity: 0.9;
+    }
+    .container {
+      max-width: 1000px;
+      margin: -2rem auto 2rem;
+      padding: 0 1rem;
+    }
+    .card {
+      background: var(--card-bg);
+      border-radius: 12px;
+      padding: 2rem;
+      margin-bottom: 2rem;
+      box-shadow: 0 10px 15px -3px rgba(0, 0, 0, 0.1), 0 4px 6px -2px rgba(0, 0, 0, 0.05);
+    }
+    h2 {
+      color: var(--primary);
+      border-bottom: 2px solid var(--bg);
+      padding-bottom: 0.5rem;
+      margin-top: 0;
+    }
+    h3 {
+      color: var(--text);
+      margin-top: 1.5rem;
+    }
+    .mermaid-container {
+      background: var(--bg);
+      border-radius: 8px;
+      padding: 1rem;
+      text-align: center;
+      overflow-x: auto;
+    }
+    code {
+      background: #f1f5f9;
+      padding: 0.2rem 0.4rem;
+      border-radius: 4px;
+      font-family: monospace;
+      color: #0f172a;
+    }
+    .trouble-item {
+      border-left: 4px solid var(--warning);
+      background: #fef3c7;
+      padding: 1rem;
+      margin-bottom: 1rem;
+      border-radius: 0 8px 8px 0;
+    }
+    .trouble-item h4 {
+      margin: 0 0 0.5rem 0;
+      color: #92400e;
+    }
+    .trouble-item.danger {
+      border-left-color: var(--danger);
+      background: #fee2e2;
+    }
+    .trouble-item.danger h4 {
+      color: #991b1b;
+    }
+    .table-container {
+      overflow-x: auto;
+    }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      margin-top: 1rem;
+    }
+    th, td {
+      text-align: left;
+      padding: 1rem;
+      border-bottom: 1px solid #e2e8f0;
+    }
+    th {
+      background: #f8fafc;
+      font-weight: 600;
+    }
+  </style>
+</head>
+<body>
+
+  <header>
+    <h1>BEATLE 自律駐車プログラム v2.0</h1>
+    <p>自動探索・推測航法バック駐車・コース復帰の完全実装ガイド</p>
+  </header>
+
+  <div class="container">
+    
+    <!-- 1. 全体フローチャート -->
+    <div class="card">
+      <h2>1. 全体の動作フロー（ステートマシン）</h2>
+      <p>プログラムは <code>switch(currentState)</code> を用いた状態遷移で動きます。交差点で停止し、空車が見つかるまで自動で左右を探し、駐車後に自力でコースに戻ります。</p>
+      <div class="mermaid-container">
+        <div class="mermaid">
+          graph TD
+            TRACE[STATE_TRACE<br>ライントレース] -->|交差点検知| INSIDE[STATE_CHECK_INSIDE<br>右を向いて内側確認]
+            INSIDE -->|空車| PARKING[STATE_PARKING<br>バック駐車実行]
+            INSIDE -->|満車| OUTSIDE[STATE_CHECK_OUTSIDE<br>180度反転して外側確認]
+            OUTSIDE -->|空車| PARKING
+            OUTSIDE -->|満車| RETURN[STATE_RETURN_LINE<br>進行方向に戻る]
+            RETURN --> TRACE
+            PARKING --> LEAVE[STATE_LEAVE_PARKING<br>駐車枠から脱出]
+            LEAVE --> TRACE
+        </div>
+      </div>
+    </div>
+
+    <!-- 2. 追加されたコア機能 -->
+    <div class="card">
+      <h2>2. 追加されたコアロジック</h2>
+      
+      <h3>A. 空車判定 (`isEmptySpot`)</h3>
+      <p>前方の赤外線センサ（<code>A5</code>ピン）を使用し、値が <code>EMPTY_THRESHOLD (初期値:300)</code> 未満であれば、壁が遠い＝空車であると判定します。</p>
+
+      <h3>B. 多項式推測航法によるバック駐車</h3>
+      <p>空車を見つけた直後のセンサ値 <code>V</code> を記憶し、以下の近似式を用いて壁までの距離 <code>D</code> を算出します。</p>
+      <code>D(mm) = 0.00224 * V^2 - 2.2585 * V + 654.5</code>
+      <p>この距離からロボットの全長を引いた分だけ、「時間制御」でバックしてピッタリと駐車します。</p>
+    </div>
+
+    <!-- 3. チューニングポイント -->
+    <div class="card">
+      <h2>3. 調整箇所（チューニングポイント）一覧</h2>
+      <p>実機テストで動きがおかしい場合は、プログラム内の以下の数値を書き換えて調整してください。</p>
+      <div class="table-container">
+        <table>
+          <thead>
+            <tr>
+              <th>変数名 / 箇所</th>
+              <th>役割</th>
+              <th>調整のコツ</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><code>EMPTY_THRESHOLD</code></td>
+              <td>空車・満車の境目となるセンサ値</td>
+              <td>空車時の値と満車時の値の中間に設定する。</td>
+            </tr>
+            <tr>
+              <td><code>turn90Right</code> 等の <code>delay(530)</code></td>
+              <td>旋回の角度（電池残量で変化）</td>
+              <td>回りすぎる場合は小さく、足りない場合は大きくする。</td>
+            </tr>
+            <tr>
+              <td><code>OFFSET_MM</code></td>
+              <td>バック距離の微調整（機体長＋マージン）</td>
+              <td>壁にぶつかるなら大きく、隙間が空くなら小さくする。</td>
+            </tr>
+            <tr>
+              <td><code>TIME_PER_MM</code></td>
+              <td>距離をバック時間に変換する係数</td>
+              <td>バックのパワー不足なら大きく、強すぎるなら小さくする。</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+
+    <!-- 4. トラブルシューティング -->
+    <div class="card">
+      <h2>4. トラブルシューティングガイド</h2>
+      <p>実験中によく起こる不具合とその解決策です。発表時の質疑応答などにもご活用ください。</p>
+
+      <div class="trouble-item danger">
+        <h4>🚨 alignToLine() の無限ループ（高速スピン）</h4>
+        <p><strong>症状:</strong> 交差点で旋回後、線を無視してその場でグルグル回り続ける。</p>
+        <p><strong>原因:</strong> 旋回角度がズレすぎて、センサが真っ白な床に出てしまったため。オプションのバグ対策コードを有効にするか、旋回の <code>delay</code> 時間を直してください。</p>
+      </div>
+
+      <div class="trouble-item">
+        <h4>⚠️ 姿勢補正中の激しい振動（オーバーシュート）</h4>
+        <p><strong>症状:</strong> 線の真上でガクガクと震えていつまでも停止しない。</p>
+        <p><strong>対策:</strong> <code>alignToLine()</code> 内の最後の <code>delay(75)</code> を <code>10~30</code> に短くするか、Pゲイン <code>Kp_align</code> を少し下げてください。</p>
+      </div>
+
+      <div class="trouble-item">
+        <h4>⚠️ 同じ交差点から抜け出せない（スタック）</h4>
+        <p><strong>症状:</strong> 満車で諦めて前進した直後、また同じ交差点で左右を見始める。</p>
+        <p><strong>対策:</strong> <code>STATE_RETURN_LINE</code> の最後にある不感時間の <code>delay(500)</code> を増やし、交差点を完全に通り過ぎるようにしてください。</p>
+      </div>
+
+      <div class="trouble-item">
+        <h4>⚠️ 実験後半でバック距離が短くなる</h4>
+        <p><strong>症状:</strong> 最初は上手く駐車できていたのに、だんだん壁に届かなくなる。</p>
+        <p><strong>対策:</strong> バッテリーの電圧低下が原因です。バッテリーを充電するか、<code>TIME_PER_MM</code> の係数を少し大きくしてください。</p>
+      </div>
+    </div>
+
+  </div>
+
+  <script>
+    mermaid.initialize({ startOnLoad: true, theme: 'neutral' });
+  </script>
+</body>
+</html>
