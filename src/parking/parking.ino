@@ -8,22 +8,42 @@ Servo servoR;
 const int PIN_MOTOR_L = 5;
 const int PIN_MOTOR_R = 4;
 
+// --- 追加: 空車判定と状態遷移用 ---
+const int PIN_IR_FRONT = A5;
+
+// 【チューニングポイント1: 空車判定の閾値】
+// 300未満なら「壁が遠い＝空車」、300以上なら「障害物が近い＝満車」と判定。
+// 実機でテストし、空車時のセンサ値と満車時のセンサ値の中間くらいに設定してください。
+const int EMPTY_THRESHOLD = 300;
+
+enum State {
+  STATE_TRACE,
+  STATE_CHECK_INSIDE,
+  STATE_CHECK_OUTSIDE,
+  STATE_RETURN_LINE,
+  STATE_PARKING,
+  STATE_LEAVE_PARKING, // 追加: 駐車枠から出る状態
+  STATE_DONE
+};
+State currentState = STATE_TRACE;
+
 // --- 調整用パラメータ（実機で後から変更する部分） ---
 // ベース速度（90が停止。左は大きく、右は小さくすると前進する）
-int baseSpeedL = 150; 
-int baseSpeedR = 30;  
+int baseSpeedL = 143; 
+int baseSpeedR = 34;  
 // アライメント（その場旋回）専用のPゲイン
-// 前進時のKpとは最適な値が異なるため、独立させます
-// float Kp_align = 0.08;
+float Kp_align = 0.10;
 
-// PI制御のゲイン（最初はKpだけ調整し、Kiは0にしておくのが定石です）
-float Kp = 0.05; //比例ゲイン(P制御)：今のズレを直すパラメータ
-float Ki = 0.00; //積分ゲイン(I制御)：過去のズレの蓄積を直すパラメータ
-// int CROSS_THRESHOLD = 3000; // 6個のセンサ値の合計がこれを超えたら交差点と判定
+// PI制御のゲイン
+float Kp = 0.04; 
+float Ki = 0.01; 
+int CROSS_THRESHOLD = 3000; 
 
 // --- グローバル変数 ---
 int v[6] = {0, 0, 0, 0, 0, 0}; // 6連センサの値
 long integral = 0;             // 積分値（I制御用）
+int targetSpotValue = 0;       // 空車判定時の赤外線センサ値（距離推定用）
+bool parkedInside = true;      // 内側・外側どちらに駐車したかの記憶用
 
 void setup() {
   Serial.begin(9600);
@@ -33,8 +53,8 @@ void setup() {
   servoR.attach(PIN_MOTOR_R);
   
   // モータ初期化（停止）
-  servoL.write(90);
-  servoR.write(90);
+  servoL.write(93);
+  servoR.write(91);
   
   delay(2000); // 起動待ち
 }
@@ -43,16 +63,13 @@ void setup() {
 // レイヤ1: ハードウェア抽象化 (HAL)
 // ==========================================
 
-// センサ値を読み取る関数
 void readLineSensors() {
   for (int i = 0; i < 6; i++) {
     v[i] = adc.readADC(i);
   }
 }
 
-// モータに値を出力する関数（安全のためのリミッタ付き）
 void setMotors(int valL, int valR) {
-  // サーボの入力範囲(0〜180)を超えないように制限
   if(valL > 180) valL = 180;
   if(valL < 0)   valL = 0;
   if(valR > 180) valR = 180;
@@ -66,42 +83,33 @@ void setMotors(int valL, int valR) {
 // レイヤ2: 制御ロジック
 // ==========================================
 
-// 加重平均による偏差(Error)の計算
 int calculateError() {
-  // 左側のセンサが黒を踏んだらマイナス、右側ならプラスの誤差を出力する
-  // (実機のセンサの並び順に合わせて符号は逆転させる必要があるかもしれません)
   int error = (-3 * v[0]) + (-2 * v[1]) + (-1 * v[2]) 
             + ( 1 * v[3]) + ( 2 * v[4]) + ( 3 * v[5]);
   return error;
 }
 
-// PI制御によるライントレース実行関数
 void traceLinePI() {
-  // ※ここでreadLineSensors()を呼ぶと、後でisCrossroad()を呼ぶときに
-  // センサを2回読んでしまうので、読み取り処理はloop()側に移動させるのがベストです。
-  // (今回は現状のままにしておきます)
   readLineSensors();
   
   int error = calculateError();
   
-  // 積分項の更新（エラーの蓄積）
   integral = integral + error;
+
+  if(integral>1000){
+    integral = 1000;
+  }else if(integral<-1000){
+    integral = -1000;
+  }
   
-  // 操作量（turn）の計算
   int turn = (error * Kp) + (integral * Ki);
   
-  // モータ出力の計算
-  // 左右のモータは鏡合わせに配置されているため、両方に「+turn」するだけで
-  // 片方は加速、片方は減速となり、自動的に差動旋回になります。
   int outL = baseSpeedL + turn;
   int outR = baseSpeedR + turn; 
   
   setMotors(outL, outR);
 }
 
-/*
-// 【追加・解除箇所D】アライメント（姿勢補正）関数
-// (ステップ4でコメントアウトを解除します)
 void alignToLine() {
   Serial.println("Start Alignment...");
   
@@ -109,95 +117,259 @@ void alignToLine() {
     readLineSensors();
     int error = calculateError();
     
-    // 誤差が「許容範囲（例: -10 〜 10）」に収まったら補正完了とみなしてループを抜ける
-    if (abs(error) < 10) {
-      setMotors(90, 90); // 停止
+    // 【オプション】真っ白な床での誤判定（暴走）を防ぐための追加条件
+    // もし旋回後にラインを見失ってあらぬ方向へ暴走する場合は、以下のブロックのコメントを外し、
+    // 下にある【デフォルト】の if (abs(error) < 5) ブロックを消してみてください。
+    /*
+    bool onLine = (v[2] > 200 || v[3] > 200); // 中央付近が黒線を踏んでいるか
+    if (abs(error) < 5 && onLine) {
+      setMotors(93, 91); // 停止
+      Serial.println("Alignment Complete!");
+      break; 
+    }
+    */
+    
+    // 【デフォルト】誤差が少なければ補正完了とする（parking_v2.inoで実績あり）
+    if (abs(error) < 5) {
+      setMotors(93, 91); // 停止
       Serial.println("Alignment Complete!");
       break; 
     }
     
-    // アライメント用のP制御（その場旋回）
     int turnSpeed = error * Kp_align;
     
-    // リミッタ（旋回スピードが速すぎると線を通り過ぎてしまうため）
-    if (turnSpeed > 40) turnSpeed = 40;
-    if (turnSpeed < -40) turnSpeed = -40;
+    if (turnSpeed > 30) turnSpeed = 30;
+    if (turnSpeed < -30) turnSpeed = -30;
     
-    // BEATLEの仕様：左右同値（150, 150等）で右回転、（30, 30等）で左回転
-    setMotors(90 + turnSpeed, 90 + turnSpeed);
+    setMotors(93 + turnSpeed, 91 + turnSpeed);
     
-    delay(10);
+    delay(75);
   }
 }
-*/
 
-/*
-// 【追加・解除箇所E】テスト用の旋回関数
-// (ステップ4でコメントアウトを解除します)
+// 【チューニングポイント4: 旋回角度の調整】
+// 電池残量やモータの個体差によって旋回スピードが変わります。
+// 90度より回りすぎる場合は delay(530) を小さく、足りない場合は大きくしてください。
 void turn90Right() {
-  // 150, 150 は右回転 [cite: 3]
   setMotors(150, 150); 
-  delay(500); // 90度くらい回る適当な時間（後で実機で調整）
-  setMotors(90, 90);
+  delay(530); // ←ここの時間を調整
+  setMotors(93, 91);
+  delay(100);
+  setMotors(98,88);
+  delay(500);
 }
-*/
+
+void turn90Left() {
+  setMotors(30, 30); 
+  delay(530); // ←右回転と同じように調整
+  setMotors(93, 91);
+  delay(100);
+  setMotors(98,88);
+  delay(500);
+}
+
+// 180度旋回は90度旋回の約2倍の時間を設定しています。実機を見て微調整してください。
+void turn180() {
+  setMotors(150, 150); 
+  delay(1060); // ←ここの時間を調整
+  setMotors(93, 91);
+  delay(100);
+  setMotors(98,88);
+  delay(500);
+}
+
+bool isEmptySpot() {
+  int val = analogRead(PIN_IR_FRONT);
+  Serial.print("Front IR: ");
+  Serial.println(val);
+  return (val < EMPTY_THRESHOLD);
+}
 
 // ==========================================
 // レイヤ3: 意思決定レイヤ (Decision Making)
 // ==========================================
 
-/* // 【追加・解除箇所B】交差点判定関数
-// (ステップ3でコメントアウトを解除します)
 bool isCrossroad() {
   int sum = 0;
-  // 6つのセンサ値の合計を計算
   for (int i = 0; i < 6; i++) {
     sum += v[i];
   }
   
-  // デバッグ用：シリアルモニタで合計値を確認
-  // Serial.print("Sensor Sum: ");
-  // Serial.println(sum);
-
-  // 合計値が閾値を超えていたら「交差点」と判定(trueを返す)
   if (sum > CROSS_THRESHOLD) {
     return true;
   } else {
     return false;
   }
 }
-*/
 
 // ==========================================
 // レイヤ4: メインループ
 // ==========================================
 void loop() {
-  /*
-  // 【追加・解除箇所C】交差点で停止するメインループ処理
-  // (ステップ3でこのブロックのコメントアウトを解除し、元のtraceLinePI()を消します)
-  
   readLineSensors(); // 毎ループ最初に1回だけセンサを読む
 
-  if (isCrossroad() == true) {
-    // 交差点を検知したらモータを停止(90)して、無限ループで待機
-    setMotors(90, 90);
-    Serial.println("Crossroad Detected! STOP.");
-    while(1) {
-      delay(100); // 完全に停止したまま動かない
-    }
-  } else {
-    // 交差点でなければライントレースを続ける
-    traceLinePI();
+  switch (currentState) {
+    case STATE_TRACE:
+      if (isCrossroad() == true) {
+        setMotors(93, 91);
+        delay(200);
+        setMotors(98,88);
+        delay(100);
+        Serial.println("Crossroad Detected! STOP.");
+        delay(1000);
+        currentState = STATE_CHECK_INSIDE;
+      } else {
+        traceLinePI();
+      }
+      break;
+
+    case STATE_CHECK_INSIDE:
+      Serial.println("Checking Inside...");
+      turn90Right();
+      alignToLine();
+      if (isEmptySpot()) {
+        targetSpotValue = analogRead(PIN_IR_FRONT); // 旋回前の値を記録
+        parkedInside = true;  // 内側に駐車したことを記憶
+        currentState = STATE_PARKING;
+      } else {
+        currentState = STATE_CHECK_OUTSIDE;
+      }
+      break;
+
+    case STATE_CHECK_OUTSIDE:
+      Serial.println("Checking Outside...");
+      turn180();
+      alignToLine();
+      if (isEmptySpot()) {
+        targetSpotValue = analogRead(PIN_IR_FRONT); // 旋回前の値を記録
+        parkedInside = false; // 外側に駐車したことを記憶
+        currentState = STATE_PARKING;
+      } else {
+        currentState = STATE_RETURN_LINE;
+      }
+      break;
+
+    case STATE_RETURN_LINE:
+      Serial.println("Return to Main Line...");
+      turn90Right(); // 外側（左）を向いている状態から右に90度回れば元の進行方向を向く
+      alignToLine();
+      
+      // 不感時間（十字マークを再び交差点と誤認しないため強制前進）
+      setMotors(baseSpeedL, baseSpeedR);
+      delay(500);
+      
+      currentState = STATE_TRACE;
+      break;
+
+    case STATE_PARKING:
+      Serial.println("Empty Spot Found! PARKING...");
+      
+      { // 変数宣言用のスコープ
+        // 1. センサ値 V から壁までの距離 D (mm) を近似式で算出
+        int V = targetSpotValue;
+        float D = 0.00224 * V * V - 2.2585 * V + 654.5;
+        
+        // 2. バックすべき距離（mm）を計算
+        // 【チューニングポイント2: バック距離の微調整】
+        // バックしすぎて壁にぶつかる場合 -> OFFSET_MM を大きくする (例: 210.0)
+        // バックが足りず隙間が空く場合   -> OFFSET_MM を小さくする (例: 170.0)
+        float OFFSET_MM = 190.0; // 170(ロボット長) + 20(壁との隙間) 等
+        float targetDistance = D - OFFSET_MM;
+        
+        // 3. 距離(mm)をバックする時間(ms)に変換する係数
+        // 【チューニングポイント3: バック時間の係数】
+        // モータのスピード（電池残量）によって進む距離が変わります。
+        // 計算距離は合っているのにバック距離が短い場合 -> TIME_PER_MM を大きくする (例: 12.0)
+        // バック距離が長すぎる場合 -> TIME_PER_MM を小さくする (例: 8.0)
+        float TIME_PER_MM = 10.0; // 100mm進むのに1000msかかる場合など
+        int backTimeMs = targetDistance * TIME_PER_MM;
+        
+        if (backTimeMs < 0) backTimeMs = 0;
+        
+        Serial.print("Target Dist(mm): ");
+        Serial.println(targetDistance);
+        Serial.print("Back Time(ms): ");
+        Serial.println(backTimeMs);
+        
+        // 4. まず壁に背を向けるために180度旋回
+        turn180();
+        alignToLine();
+        
+        // 5. バックの実行 (ベース速度を反転させて後退)
+        int reverseL = 180 - baseSpeedL; // 例: 180 - 143 = 37
+        int reverseR = 180 - baseSpeedR; // 例: 180 - 34 = 146
+        setMotors(reverseL, reverseR);
+        delay(backTimeMs);
+        
+        setMotors(93, 91); // 停止
+        Serial.println("Parking Completed.");
+        
+        // 駐車後、3秒間停止してアピール
+        delay(3000); 
+      }
+      
+      currentState = STATE_LEAVE_PARKING;
+      break;
+
+    case STATE_LEAVE_PARKING:
+      Serial.println("Leaving Parking Spot...");
+      
+      // 【チューニングポイント5: 駐車枠からの脱出】
+      // 駐車枠内に線がある場合は traceLinePI() を使う手もありますが、
+      // ここではシンプルに前進して交差点（メインライン）を探します。
+
+      /*
+      // =============================================================
+      // 【オプション】駐車枠内のラインを使ってまっすぐに復帰する場合
+      // もし脱出時に斜めにズレてしまう場合は、このブロックのコメントを外し、
+      // 下の【デフォルト】の setMotors(baseSpeedL, baseSpeedR); を消してください。
+      
+      setMotors(baseSpeedL, baseSpeedR); // ラインを探しながら前進
+      if (v[2] > 500 || v[3] > 500) {    // 中央のセンサがラインを捉えたら
+        setMotors(93, 91); delay(100);
+        alignToLine();                   // ラインに対して真っ直ぐに補正
+        
+        // 補正後、交差点が見つかるまでライントレースで進む
+        while (isCrossroad() == false) {
+          traceLinePI();
+          delay(10);
+        }
+      }
+      // =============================================================
+      */
+      
+      // 【デフォルト】単純に前進して交差点を探す
+      setMotors(baseSpeedL, baseSpeedR);
+      
+      if (isCrossroad()) {
+        // メインラインに到達
+        setMotors(93, 91);
+        delay(500);
+        
+        if (parkedInside) {
+          // 右側の枠から出てきた = 現在左を向いている
+          // メインラインの進行方向を向くには右に90度
+          turn90Right();
+        } else {
+          // 左側の枠から出てきた = 現在右を向いている
+          // メインラインの進行方向を向くには左に90度
+          turn90Left();
+        }
+        alignToLine();
+        
+        // 交差点を完全に通り抜けるための不感時間
+        setMotors(baseSpeedL, baseSpeedR);
+        delay(500);
+        
+        currentState = STATE_TRACE; // 再び探索の旅へ
+      }
+      break;
+
+    case STATE_DONE:
+      setMotors(93, 91);
+      while(1) { delay(100); }
+      break;
   }
-  */
-
-  // --- ステップ1（現在）の処理 ---
-  // 上記のコメントを外した時は、以下の1行は削除（またはコメントアウト）してください
-
   
-  // ひたすらライントレースを続ける
-  traceLinePI();
-  
-  // 制御周期（10ms〜20ms程度が一般的です）
   delay(10); 
 }
